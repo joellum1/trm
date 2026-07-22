@@ -107,7 +107,10 @@ class AdamATan2(Optimizer):
     def step(self):
         """Perform a single optimization step.
         """
-        self._cuda_graph_capture_health_check()
+        if hasattr(self, "_cuda_graph_capture_health_check"):
+            self._cuda_graph_capture_health_check()
+        elif hasattr(self, "_accelerator_graph_capture_health_check"):
+            self._accelerator_graph_capture_health_check()
 
         for group in self.param_groups:
             params_with_grad = []

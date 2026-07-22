@@ -26,8 +26,8 @@ cli = ArgParser()
 
 
 class DataProcessConfig(BaseModel):
-    train_csv: str = "data/maze-custom-raw/train.csv"
-    test_csv: str = "data/maze-custom-raw/test.csv"
+    train_csv: str = "data/maze-custom/train.csv"
+    test_csv: str = "data/maze-custom/test.csv"
     output_dir: str = "data/maze-custom"
 
     subsample_size: Optional[int] = None
