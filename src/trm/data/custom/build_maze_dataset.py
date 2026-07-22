@@ -26,8 +26,8 @@ cli = ArgParser()
 
 
 class DataProcessConfig(BaseModel):
-    train_csv: str = "train.csv"
-    test_csv: str = "test.csv"
+    train_csv: str = "data/custom_raw/train.csv"
+    test_csv: str = "data/custom_raw/test.csv"
     output_dir: str = "data/maze-custom"
 
     subsample_size: Optional[int] = None
@@ -176,11 +176,11 @@ def convert_subset(set_name: str, csv_path: str, config: DataProcessConfig):
 @cli.command(singleton=True)
 def preprocess_data(config: DataProcessConfig):
 
-    # convert_subset(
-    #     "train",
-    #     config.train_csv,
-    #     config
-    # )
+    convert_subset(
+        "train",
+        config.train_csv,
+        config
+    )
 
     convert_subset(
         "test",
