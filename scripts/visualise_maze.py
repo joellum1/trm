@@ -24,13 +24,36 @@ import torch
 
 GRID_SIZE = 30
 
-# Dataset IDs
+# Dataset IDs -- must match CHARSET order in build_maze_dataset.py
+# ("# SGoCRrNn"). The first 5 match the original sapientinc charset.
 PAD = 0
 WALL = 1
 EMPTY = 2
 START = 3
 GOAL = 4
-PATH = 5
+PATH = 5          # 'o' -- empty tile that was crossed
+CHECKPOINT = 6     # 'C' -- mandatory tile, always crossed
+REWARD = 7         # 'R' -- optional bonus tile, not crossed
+REWARD_PATH = 8    # 'r' -- optional bonus tile, crossed
+PENALTY = 9        # 'N' -- optional penalty tile, not crossed
+PENALTY_PATH = 10  # 'n' -- optional penalty tile, crossed
+
+# Any of these IDs mean "this cell is part of the solved route"
+PATH_IDS = {PATH, REWARD_PATH, PENALTY_PATH}
+
+ID_COLOUR = {
+    WALL: "black",
+    EMPTY: "white",
+    PAD: "white",
+    START: "limegreen",
+    GOAL: "red",
+    PATH: "dodgerblue",
+    CHECKPOINT: "gold",
+    REWARD: "palegreen",
+    REWARD_PATH: "darkgreen",
+    PENALTY: "orchid",
+    PENALTY_PATH: "indigo",
+}
 
 
 def draw_maze(ax, grid, title):
@@ -47,24 +70,7 @@ def draw_maze(ax, grid, title):
         for c in range(GRID_SIZE):
 
             value = int(grid[r, c])
-
-            if value == WALL:
-                colour = "black"
-
-            elif value == EMPTY or value == PAD:
-                colour = "white"
-
-            elif value == START:
-                colour = "limegreen"
-
-            elif value == GOAL:
-                colour = "red"
-
-            elif value == PATH:
-                colour = "dodgerblue"
-
-            else:
-                colour = "magenta"
+            colour = ID_COLOUR.get(value, "magenta")
 
             ax.add_patch(
                 patches.Rectangle(
@@ -85,6 +91,9 @@ def draw_difference(ax, pred, label):
     Green  = correct path
     Red    = false positive
     Yellow = false negative
+
+    Applies to any path-bearing tile (plain path, or a crossed reward/penalty
+    tile), not just the original plain-path case.
     """
 
     ax.set_xlim(0, GRID_SIZE)
@@ -100,29 +109,34 @@ def draw_difference(ax, pred, label):
             gt = int(label[r, c])
             pd = int(pred[r, c])
 
-            # Draw maze background first
+            # Draw maze background first (static tiles keep their identity;
+            # checkpoints/rewards/penalties render at their "base" colour)
 
             if gt == WALL:
                 colour = "black"
-
             elif gt == START:
                 colour = "limegreen"
-
             elif gt == GOAL:
                 colour = "red"
-
+            elif gt == CHECKPOINT:
+                colour = "gold"
+            elif gt in (REWARD, REWARD_PATH):
+                colour = "palegreen"
+            elif gt in (PENALTY, PENALTY_PATH):
+                colour = "orchid"
             else:
                 colour = "white"
 
-            # Overlay prediction differences
+            # Overlay prediction correctness for path-bearing tiles
 
-            if gt == PATH and pd == PATH:
+            gt_is_path = gt in PATH_IDS
+            pd_is_path = pd in PATH_IDS
+
+            if gt_is_path and pd_is_path:
                 colour = "lime"
-
-            elif gt != PATH and pd == PATH:
+            elif not gt_is_path and pd_is_path:
                 colour = "red"
-
-            elif gt == PATH and pd != PATH:
+            elif gt_is_path and not pd_is_path:
                 colour = "yellow"
 
             ax.add_patch(

@@ -13,8 +13,13 @@ from huggingface_hub import hf_hub_download
 from trm.data.common import PuzzleDatasetMetadata, dihedral_transform
 
 
-CHARSET = "# SGo"
-
+# First 5 chars kept in their original order/ids for backward compatibility
+# with the base sapientinc maze charset (# wall, space empty, S start, G
+# goal, o solved-path). The rest are objective tiles:
+#   C        checkpoint      -- must be crossed (always shown as C, visited or not)
+#   R / r    reward tile     -- optional; r = reward tile that was crossed
+#   N / n    penalty tile    -- optional; n = penalty tile that was crossed
+CHARSET = "# SGoCRrNn"
 
 
 cli = ArgParser()
