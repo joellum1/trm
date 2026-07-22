@@ -7,7 +7,7 @@ WIDTH = 30
 HEIGHT = 30
 
 # Which maze to build, and how strongly reward/penalty tiles pull the route.
-MAZE_FILE = "src/trm/data/custom/maze_objectives.txt"
+MAZE_FILE = "src/trm/data/custom/maze.txt"
 REWARD_BONUS = DEFAULT_REWARD_BONUS
 PENALTY_COST = DEFAULT_PENALTY_COST
 
