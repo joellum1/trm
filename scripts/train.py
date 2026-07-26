@@ -44,6 +44,7 @@ import math
 import yaml
 import shutil
 import copy
+import csv
 
 import torch.distributed as dist
 from torch import nn
@@ -160,14 +161,14 @@ def launch(hydra_config: DictConfig):
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     try:
         eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except:
-        print("NO EVAL DATA FOUND")
+    except Exception as e:
+        print(f"NO EVAL DATA FOUND: {e}")
         eval_loader = eval_metadata = None
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except:
-        print("No evaluator found")
+    except Exception as e:
+        print(f"No evaluator found: {e}")
         evaluators = []
 
     # Train state
@@ -176,10 +177,43 @@ def launch(hydra_config: DictConfig):
     # Progress bar and logger
     progress_bar = None
     ema_helper = None
+    metrics_csv = None
+    metrics_writer = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+
+        # Bug fix: config.checkpoint_path isn't created on disk until
+        # save_code_and_config() runs its os.makedirs() call below -- and
+        # that happens *after* this block used to try opening the metrics
+        # CSV inside it, which raised FileNotFoundError on a fresh run.
+        # Ensure the directory exists first.
+        os.makedirs(config.checkpoint_path, exist_ok=True)
+
+        metrics_csv = open(
+            os.path.join(config.checkpoint_path, "training_metrics.csv"),
+            "w",
+            newline=""
+        )
+
+        metrics_writer = csv.writer(metrics_csv)
+        metrics_writer.writerow([
+            "step",
+            "epoch",
+            "train_loss",
+            "eval_loss",
+            "accuracy",
+            "exact_accuracy",
+            "q_halt_accuracy",
+            "q_halt_loss",
+            "learning_rate"
+        ])
+        # Bug fix: this used to call wandb.log(metrics, ...) here, but
+        # `metrics` doesn't exist until the training loop below assigns it --
+        # that was a guaranteed NameError on every run. Nothing valid to log
+        # yet at this point, so the call is just removed.
+
         save_code_and_config(config)
     if config.ema:
         print('Setup EMA')
@@ -200,6 +234,19 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                if metrics_writer is not None:
+                    metrics_writer.writerow([
+                        train_state.step,
+                        _iter_id * train_epochs_per_iter,
+                        metrics.get("loss", ""),
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        metrics.get("lr", "")
+                    ])
+                    metrics_csv.flush()
             if config.ema:
                 ema_helper.update(train_state.model)
 
@@ -225,6 +272,20 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+
+                if metrics_writer is not None:
+                    metrics_writer.writerow([
+                        train_state.step,
+                        (_iter_id + 1) * train_epochs_per_iter,
+                        "",
+                        metrics.get("loss", ""),
+                        metrics.get("accuracy", ""),
+                        metrics.get("exact_accuracy", ""),
+                        metrics.get("q_halt_accuracy", ""),
+                        metrics.get("q_halt_loss", ""),
+                        ""
+                    ])
+                    metrics_csv.flush()
                 
             ############ Checkpointing
             if RANK == 0:
@@ -239,6 +300,8 @@ def launch(hydra_config: DictConfig):
     if dist.is_initialized():
         dist.destroy_process_group()
     wandb.finish()
+    if metrics_csv is not None:
+        metrics_csv.close()
 
 
 if __name__ == "__main__":
