@@ -19,6 +19,7 @@ from trm.data.common import PuzzleDatasetMetadata, dihedral_transform
 #   C        checkpoint      -- must be crossed (always shown as C, visited or not)
 #   R / r    reward tile     -- optional; r = reward tile that was crossed
 #   N / n    penalty tile    -- optional; n = penalty tile that was crossed
+OLD_CHARSET = "# SGo"
 CHARSET = "# SGoCRrNn"
 
 
