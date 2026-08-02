@@ -129,8 +129,8 @@ def main():
     print(f"dataset vocab_size={eval_metadata.vocab_size} "
           f"seq_len={eval_metadata.seq_len} "
           f"puzzles={eval_metadata.num_puzzle_identifiers}")
-    assert eval_metadata.vocab_size == a.v_old, (
-        f"expected the ORIGINAL dataset (vocab {a.v_old}), "
+    assert eval_metadata.vocab_size in (6, a.v_old), (
+        f"expected the ORIGINAL maze dataset (vocab 6), "
         f"got vocab {eval_metadata.vocab_size} -- wrong --data path?")
 
     eval_metadata = copy.deepcopy(eval_metadata)

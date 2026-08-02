@@ -201,6 +201,10 @@ def main():
 
     unmatched_old = [k for k in old_state if k not in new_state]
 
+    # The fresh model lives on CUDA; old_state was loaded to CPU. Normalise
+    # everything to CPU so comparisons work and the saved file is portable.
+    merged = {k: v.detach().cpu() for k, v in merged.items()}
+
     # ---------------------------------------------------------------- report
     print(f"\n{len(exact)} parameter(s) copied exactly (identical shape).")
 

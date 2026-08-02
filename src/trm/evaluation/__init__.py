@@ -5,9 +5,11 @@ from trm.evaluation.evaluator import (
     create_evaluators,
 )
 from trm.evaluation.arc import ARC
+from trm.evaluation.maze_path import MazePath
 
 __all__ = [
     "evaluate",
     "create_evaluators",
     "ARC",
+    "MazePath"
 ]
