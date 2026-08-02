@@ -1,0 +1,78 @@
+# config/t0_zero_step.yaml
+#
+# RESOLVED config (Hydra output form, not a Hydra input) for the T0
+# zero-step diagnostic. Consumed directly as PretrainConfig(**yaml.safe_load(f)).
+# Do NOT add `defaults:`, `hydra:`, or ${...} interpolations here -- this file
+# is loaded with plain yaml.safe_load, which does not resolve them.
+#
+# The arch block reproduces the published MAZE-HARD pretraining recipe from
+# scripts/cmd.sh line 3:
+#
+#   arch=trm ... arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=4 ... ema=True
+#
+# NOTE: config/arch/trm.yaml ships L_cycles: 6. The maze run overrides it to 4.
+# Cycle counts change NO tensor shapes, so a mismatch loads with zero missing
+# and zero unexpected keys and silently runs the wrong recursion depth. The
+# values below must match the checkpoint's training run exactly.
+
+arch:
+  name: architectures.trm@TinyRecursiveReasoningModel_ACTV1
+  loss:
+    name: losses@ACTLossHead
+    loss_type: stablemax_cross_entropy
+
+  halt_exploration_prob: 0.1
+  halt_max_steps: 16
+
+  H_cycles: 3          # cmd.sh override
+  L_cycles: 4          # cmd.sh override (base trm.yaml says 6)
+  H_layers: 0
+  L_layers: 2          # cmd.sh override
+
+  hidden_size: 512
+  num_heads: 8
+  expansion: 4
+
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  mlp_t: false
+  no_ACT_continue: true
+
+# ---- data: overridden by t0_zero_step.py --data, listed for completeness ----
+data_paths: ['data/maze-30x30-hard-1k']
+data_paths_test: ['data/maze-30x30-hard-1k']
+evaluators: []
+
+# ---- eval-only: nothing here trains, but PretrainConfig requires the fields --
+global_batch_size: 32       # eval batch; published eval used 1536 on 8 GPUs
+epochs: 1
+eval_interval: 1
+min_eval_interval: 0
+checkpoint_every_eval: false
+eval_save_outputs: []
+
+lr: 2.0e-4                  # published maze value; unused in eval
+lr_min_ratio: 1.0
+lr_warmup_steps: 4000
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_weight_decay: 1.0
+puzzle_emb_lr: 1.0e-4
+
+seed: 0
+freeze_weights: false
+
+# The published 83.87% was measured with --apply-ema. step_32550 is expected
+# to already hold EMA weights; if your control run undershoots, this is the
+# first thing to check.
+ema: true
+ema_rate: 0.999
+
+load_checkpoint: null       # set programmatically after the transplant
+checkpoint_path: checkpoints/t0_zero_step
+project_name: T0-diagnostic
+run_name: zero_step_eval

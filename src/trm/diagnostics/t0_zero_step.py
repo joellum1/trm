@@ -155,12 +155,22 @@ def main():
             eval_loader=cast(Any, eval_loader), eval_metadata=eval_metadata,
             evaluators=evaluators, rank=0, world_size=1, cpu_group=None)
 
-    flat = {}
-    for _, m in cast(dict, metrics).items():
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    assert metrics is not None, "evaluate() returned None (rank != 0?)"
+    flat, eval_set = {}, None
+    for set_name, m in cast(dict, metrics).items():
         if isinstance(m, dict) and "exact_accuracy" in m:
-            flat = {k: float(v) for k, v in m.items()
-                    if isinstance(v, (int, float))}
+            flat = {k: _f(v) for k, v in m.items()}
+            eval_set = set_name
             break
+    assert flat, f"no metric dict found; evaluate() returned: {metrics!r}"
+    print(f"[{eval_set}] " + "  ".join(f"{k}={v:.4f}" for k, v in flat.items()
+                                       if v is not None))
 
     try:
         sha = subprocess.check_output(
