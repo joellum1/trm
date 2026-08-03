@@ -11,6 +11,15 @@ import os
 # third-party libraries (e.g. networkx, older packages) still reference
 # (like `np.int`, `np.bool`). This avoids AttributeError on import when
 # running with newer numpy versions that may have removed those names.
+#
+# CRITICAL: only fill in names numpy does NOT already define. numpy 2.x
+# reintroduced `np.bool` (== np.bool_) and `np.long`, and overwriting them
+# with the Python builtins corrupts numpy.ma: its `nomask` sentinel is
+# built from `np.bool`, so it becomes a plain Python `False` and every
+# masked-array operation dies with
+#     AttributeError: 'bool' object has no attribute 'view'
+# numpy.ma is imported lazily (pandas -> wandb), so the failure surfaces
+# far from here, typically inside wandb.log().
 try:
     import numpy as np
 
@@ -26,6 +35,9 @@ try:
     }
 
     for _name, _val in _np_compat_aliases.items():
+        if hasattr(np, _name):
+            # numpy defines this itself -- leave it alone.
+            continue
         try:
             setattr(np, _name, _val)
         except Exception:
@@ -41,6 +53,7 @@ from typing import Optional, Any, Sequence, List, cast
 from dataclasses import dataclass
 import os
 import math
+import json
 import yaml
 import shutil
 import copy
@@ -77,8 +90,40 @@ from trm.training import (
 from trm.evaluation import evaluate, create_evaluators
 
 
+def _flatten_metrics(metrics) -> dict:
+    """evaluate() returns {set_name: {metric: value}}; evaluators merge their
+    own flat keys (e.g. 'path/valid') in at the top level. Flatten both into
+    one dict of plain floats."""
+    out = {}
+    if not isinstance(metrics, dict):
+        return out
+    for k, v in metrics.items():
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                try:
+                    out[f"{k}/{kk}"] = float(vv)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _eval_set_metrics(metrics) -> dict:
+    """Pull out the per-set metric dict that carries exact_accuracy."""
+    if not isinstance(metrics, dict):
+        return {}
+    for v in metrics.values():
+        if isinstance(v, dict) and "exact_accuracy" in v:
+            return v
+    return {}
+
+
 def save_code_and_config(config: PretrainConfig):
-    if config.checkpoint_path is None or wandb.run is None:
+    if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
@@ -94,13 +139,20 @@ def save_code_and_config(config: PretrainConfig):
 
             shutil.copy(code_file, os.path.join(config.checkpoint_path, code_name))
 
-    # Dump config as yaml
+    # Dump config as yaml. Written unconditionally: this file is the record of
+    # what actually ran (load_checkpoint, batch size, lr, ...) and is the first
+    # thing you want when a run misbehaves. It used to be skipped whenever
+    # wandb.run was None, i.e. under WANDB_MODE=disabled.
     config_file = os.path.join(config.checkpoint_path, "all_config.yaml")
     with open(config_file, "wt") as f:
         yaml.dump(config.model_dump(), f)
 
     # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    if wandb.run is not None:
+        try:
+            wandb.run.log_code(config.checkpoint_path)
+        except Exception as e:
+            print(f"wandb.log_code skipped: {e}")
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
@@ -139,7 +191,7 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
+
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
         assert (
@@ -171,6 +223,14 @@ def launch(hydra_config: DictConfig):
         print(f"No evaluator found: {e}")
         evaluators = []
 
+    if RANK == 0:
+        print(f"[data] train examples={train_metadata.total_groups} "
+              f"vocab={train_metadata.vocab_size} seq_len={train_metadata.seq_len}")
+        print(f"[run ] batch={config.global_batch_size} epochs={config.epochs} "
+              f"eval_interval={config.eval_interval} lr={config.lr} "
+              f"load_checkpoint={config.load_checkpoint}")
+        print(f"[eval] evaluators={[type(e).__name__ for e in evaluators]}")
+
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
@@ -180,6 +240,8 @@ def launch(hydra_config: DictConfig):
     metrics_csv = None
     metrics_writer = None
     if RANK == 0:
+        print(f"[run ] total_steps={train_state.total_steps} "
+              f"(~{train_state.total_steps / max(total_iters, 1):.0f} per eval interval)")
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
@@ -209,12 +271,23 @@ def launch(hydra_config: DictConfig):
             "q_halt_loss",
             "learning_rate"
         ])
+
+        # Full eval metrics (including evaluator keys like path/*) go to their
+        # own file -- the fixed-column CSV above cannot represent them.
+        eval_jsonl = open(
+            os.path.join(config.checkpoint_path, "eval_metrics.jsonl"),
+            "w", encoding="utf-8"
+        )
+
         # Bug fix: this used to call wandb.log(metrics, ...) here, but
         # `metrics` doesn't exist until the training loop below assigns it --
         # that was a guaranteed NameError on every run. Nothing valid to log
         # yet at this point, so the call is just removed.
 
         save_code_and_config(config)
+    else:
+        eval_jsonl = None
+
     if config.ema:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
@@ -232,21 +305,34 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                flat = _flatten_metrics(metrics)
+
+                # Print BEFORE wandb.log: if wandb raises, the numbers survive
+                # in the log rather than being lost with the run.
+                if train_state.step % 20 == 0 or train_state.step <= 5:
+                    print("TRAIN_METRICS step=%d " % train_state.step +
+                          "  ".join(f"{k}={v:.5f}" for k, v in sorted(flat.items())),
+                          flush=True)
+
                 if metrics_writer is not None:
+                    loss = next((v for k, v in flat.items() if k.endswith("loss")), "")
+                    lr = next((v for k, v in flat.items() if k.endswith("lr")), "")
                     metrics_writer.writerow([
                         train_state.step,
                         _iter_id * train_epochs_per_iter,
-                        metrics.get("loss", ""),
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        metrics.get("lr", "")
+                        loss,
+                        "", "", "", "", "",
+                        lr,
                     ])
                     metrics_csv.flush()
+
+                try:
+                    wandb.log(metrics, step=train_state.step)
+                except Exception as e:
+                    print(f"wandb.log failed (continuing): {type(e).__name__}: {e}")
+
+                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+
             if config.ema:
                 ema_helper.update(train_state.model)
 
@@ -261,32 +347,49 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
+            metrics = evaluate(config,
+                train_state_eval,
+                eval_loader,
+                eval_metadata,
                 evaluators,
-                rank=RANK, 
+                rank=RANK,
                 world_size=WORLD_SIZE,
                 cpu_group=CPU_PROCESS_GROUP)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                flat = _flatten_metrics(metrics)
+
+                # Print BEFORE wandb.log, for the same reason as above.
+                print("EVAL_METRICS step=%d " % train_state.step +
+                      json.dumps(flat, sort_keys=True), flush=True)
+
+                if eval_jsonl is not None:
+                    eval_jsonl.write(json.dumps(
+                        {"step": train_state.step,
+                         "epoch": (_iter_id + 1) * train_epochs_per_iter,
+                         **flat}) + "\n")
+                    eval_jsonl.flush()
 
                 if metrics_writer is not None:
+                    _m = _eval_set_metrics(metrics)
                     metrics_writer.writerow([
                         train_state.step,
                         (_iter_id + 1) * train_epochs_per_iter,
                         "",
-                        metrics.get("loss", ""),
-                        metrics.get("accuracy", ""),
-                        metrics.get("exact_accuracy", ""),
-                        metrics.get("q_halt_accuracy", ""),
-                        metrics.get("q_halt_loss", ""),
+                        _m.get("loss", ""),
+                        _m.get("accuracy", ""),
+                        _m.get("exact_accuracy", ""),
+                        _m.get("q_halt_accuracy", ""),
+                        _m.get("q_halt_loss", ""),
                         ""
                     ])
                     metrics_csv.flush()
-                
+
+                try:
+                    wandb.log(metrics, step=train_state.step)
+                except Exception as e:
+                    print(f"wandb.log failed (continuing): {type(e).__name__}: {e}")
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
@@ -299,9 +402,14 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    try:
+        wandb.finish()
+    except Exception:
+        pass
     if metrics_csv is not None:
         metrics_csv.close()
+    if eval_jsonl is not None:
+        eval_jsonl.close()
 
 
 if __name__ == "__main__":
