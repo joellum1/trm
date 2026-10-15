@@ -1,0 +1,577 @@
+"""Build the thesis outputs in report/ from results/ (IDs match docs/EXPERIMENTS.md).
+
+    scripts/katana/pull_results.sh && python scripts/make_report.py
+
+Writes figures (PDF + PNG), booktabs tables (+ CSV), numbers.tex/.json (inline
+values) and a README manifest. Regenerated from scratch each run; experiments
+without results yet are listed as pending.
+"""
+
+import csv
+import json
+import math
+import shutil
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import yaml
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.path import Path as MPath
+from matplotlib.patches import PathPatch
+from matplotlib.ticker import PercentFormatter
+
+ROOT = Path(__file__).resolve().parents[1]
+RES = ROOT / "results"
+OUT = ROOT / "report"
+
+# Print style. Palette (slots 1-3, ordinal blue ramp) checked with the dataviz validator on white.
+INK, INK2, AXIS, GRID = "#0b0b0b", "#52514e", "#b9b8b3", "#e8e7e3"
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]           # blue, orange, aqua
+MARKERS = ["o", "s", "^"]                              # greyscale backup channel
+LINESTYLES = ["-", "--", "-."]
+ORDINAL = ["#104281", "#256abf", "#5598e7", "#86b6ef"]  # best -> worst outcome
+NEUTRAL = "#9a9993"
+WIDTH = 6.3  # inches: A4 text width with ~2.5 cm margins
+
+plt.rcParams.update({
+    "font.size": 9, "axes.labelsize": 9, "xtick.labelsize": 8, "ytick.labelsize": 8,
+    "legend.fontsize": 8, "axes.edgecolor": AXIS, "axes.labelcolor": INK2,
+    "xtick.color": INK2, "ytick.color": INK2, "axes.linewidth": 0.6,
+    "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+    "lines.linewidth": 1.5, "lines.solid_capstyle": "round", "lines.solid_joinstyle": "round",
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.dpi": 300,
+})
+
+OUTCOMES = [("exact", "Exact match"), ("alt_shortest", "Valid, shortest (≠ label)"),
+            ("longer", "Valid, longer"), ("broken", "Broken")]
+
+OUTCOMES_TEX = [(k, lab.replace("≠", "$\\neq$")) for k, lab in OUTCOMES]
+
+manifest = []   # (experiment, output, description, status)
+numbers = {}
+
+
+def style_axes(ax, pct_y=True, grid_axis="y"):
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis=grid_axis, color=GRID, linewidth=0.6, linestyle="-")
+    ax.set_axisbelow(True)
+    if pct_y:
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+
+
+def save(fig, name, experiment, description):
+    for ext in ("pdf", "png"):
+        fig.savefig(OUT / "figures" / f"{name}.{ext}", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    manifest.append((experiment, f"figures/{name}.pdf", description, "generated"))
+
+
+def rounded_bar(ax, x0, x1, yc, h, color, horizontal=True, r_px=3.0):
+    """Bar with a rounded data end. Call once limits and margins are final (radius in pixels)."""
+    to_px = ax.transData.transform
+    (px0, py0), (px1, py1) = to_px((0, 0)), to_px((1, 1))
+    rx, ry = r_px / max(abs(px1 - px0), 1e-9), r_px / max(abs(py1 - py0), 1e-9)
+    hh = h / 2
+    if horizontal:
+        rx = min(rx, max(x1 - x0, 0) / 2); ry = min(ry, hh)
+        v = [(x0, yc - hh), (x1 - rx, yc - hh), (x1, yc - hh), (x1, yc - hh + ry),
+             (x1, yc + hh - ry), (x1, yc + hh), (x1 - rx, yc + hh), (x0, yc + hh), (x0, yc - hh)]
+    else:  # vertical column from y=x0 to y=x1 centred at x=yc
+        ry = min(ry, max(x1 - x0, 0) / 2); rx = min(rx, hh)
+        v = [(yc - hh, x0), (yc - hh, x1 - ry), (yc - hh, x1), (yc - hh + rx, x1),
+             (yc + hh - rx, x1), (yc + hh, x1), (yc + hh, x1 - ry), (yc + hh, x0), (yc - hh, x0)]
+    c = [MPath.MOVETO, MPath.LINETO, MPath.CURVE3, MPath.CURVE3, MPath.LINETO,
+         MPath.CURVE3, MPath.CURVE3, MPath.LINETO, MPath.CLOSEPOLY]
+    ax.add_patch(PathPatch(MPath(v, c), facecolor=color, edgecolor="none"))
+
+
+def wilson(k, n, z=1.96):
+    if n == 0:
+        return float("nan"), float("nan")
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return c - h, c + h
+
+
+def pct(x, nd=1):
+    return f"{100 * x:.{nd}f}\\%"
+
+
+TEX_TO_PLAIN = [("\\midrule ", ""), ("\\quad ", "  "), ("\\%", "%"), ("\\&", "&"),
+                ("$\\neq$", "≠"), ("$\\geq$", "≥"), ("$>$", ">"), ("$^\\dagger$", " (corrected)")]
+
+
+def plain(cell):
+    cell = str(cell)
+    for a, b in TEX_TO_PLAIN:
+        cell = cell.replace(a, b)
+    return cell
+
+
+def write_table(name, header, rows, experiment, description, colspec=None, notes=None, super_header=None):
+    """Rows are LaTeX; a first cell starting '\\midrule ' adds a rule. CSV copy is plain text."""
+    with open(OUT / "tables" / f"{name}.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([plain(h) for h in header])
+        w.writerows([[plain(c) for c in r] for r in rows])
+    colspec = colspec or "l" + "r" * (len(header) - 1)
+    tex = ["% Generated by scripts/make_report.py -- do not edit by hand.",
+           "% Needs \\usepackage{booktabs}.",
+           f"\\begin{{tabular}}{{{colspec}}}", "\\toprule"]
+    if super_header:   # raw LaTeX line(s) above the column headers, e.g. a \multicolumn group
+        tex.append(super_header)
+    tex += [" & ".join(header) + r" \\", "\\midrule"]
+    for r in rows:
+        if str(r[0]).startswith("\\midrule "):
+            tex.append("\\midrule")
+            r = [str(r[0])[len("\\midrule "):]] + list(r[1:])
+        tex.append(" & ".join(str(c) for c in r) + r" \\")
+    tex += ["\\bottomrule", "\\end{tabular}"]
+    if notes:
+        tex.append("% Note: " + notes)
+    (OUT / "tables" / f"{name}.tex").write_text("\n".join(tex) + "\n")
+    manifest.append((experiment, f"tables/{name}.tex", description, "generated"))
+
+
+def pending(experiment, what, why):
+    manifest.append((experiment, what, why, "pending"))
+
+
+def load_verdicts(path):
+    return [json.loads(l) for l in open(path) if l.strip()]
+
+
+def outcome_counts(verdicts):
+    c = Counter()
+    for v in verdicts:
+        if v["category"] == "valid_shortest":
+            c["exact" if v.get("exact") else "alt_shortest"] += 1
+        elif v["category"] == "valid_longer":
+            c["longer"] += 1
+        else:
+            c["broken"] += 1
+    return c
+
+
+# --- A1: task properties ---
+def _open_cells(rows):
+    return {(r, c) for r, row in enumerate(rows) for c, t in enumerate(row) if t != "#"}
+
+
+def _nbrs(p, cells):
+    r, c = p
+    return [q for q in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)) if q in cells]
+
+
+def _n_components(cells):
+    seen, k = set(), 0
+    for p in cells:
+        if p in seen:
+            continue
+        k += 1
+        stack = [p]; seen.add(p)
+        while stack:
+            for q in _nbrs(stack.pop(), cells):
+                if q not in seen:
+                    seen.add(q); stack.append(q)
+    return k
+
+
+def _has_cycle(cells):
+    edges = sum(((r + 1, c) in cells) + ((r, c + 1) in cells) for r, c in cells)
+    return edges != len(cells) - _n_components(cells)
+
+
+def _n_shortest_paths(rows):
+    """Number of distinct shortest S->G paths (BFS path counting)."""
+    cells = _open_cells(rows)
+    s = next((r, c) for r, row in enumerate(rows) for c, t in enumerate(row) if t == "S")
+    g = next((r, c) for r, row in enumerate(rows) for c, t in enumerate(row) if t == "G")
+    dist, count, frontier = {s: 0}, {s: 1}, [s]
+    while frontier:
+        nxt = []
+        for p in frontier:
+            for q in _nbrs(p, cells):
+                if q not in dist:
+                    dist[q] = dist[p] + 1; count[q] = 0; nxt.append(q)
+                if dist[q] == dist[p] + 1:
+                    count[q] += count[p]
+        frontier = nxt
+    return count.get(g, 0)
+
+
+def task_properties():
+    """Why exact match is (or is not) the right metric for each task."""
+    from trm.evaluation.maze_checker import to_rows
+    from trm.data.custom.solve import solve_maze
+    rows_out = []
+    custom = ROOT / "data" / "maze-custom-eval1k" / "test" / "all__inputs.npy"
+    if custom.exists():
+        X = [to_rows(x) for x in np.load(custom)]
+        cyc = sum(_has_cycle(_open_cells(r)) for r in X)
+        rn = 0
+        for r in X:
+            _, pw, _ = solve_maze(r)
+            _, pu, _ = solve_maze(r, reward_bonus=0.0, penalty_cost=0.0)
+            rn += set(pw) != set(pu)
+        multi = sum(sum(row.count("C") for row in r) >= 2 for r in X)
+        numbers.update(CustomEvalN=len(X), CustomCycleMazes=cyc, CustomWeightsChangeRoute=rn,
+                       CustomMultiCheckpoint=multi)
+        rows_out += [["Custom (1,000-maze eval set)", f"{len(X):,}", f"{cyc}", f"{multi}", f"{rn}", "1 (unique)"]]
+    else:
+        pending("A1", "tables/tab_task_properties.tex", "data/maze-custom-eval1k missing (scripts/build_maze_splits.py)")
+    hard = ROOT / "data" / "maze-30x30-hard-1k" / "test" / "all__inputs.npy"
+    if hard.exists():
+        X = [to_rows(x) for x in np.load(hard)]
+        cyc = sum(_has_cycle(_open_cells(r)) for r in X)
+        k = np.array([_n_shortest_paths(r) for r in X], dtype=float)
+        multi_sp = int((k > 1).sum())
+        numbers.update(HardN=len(X), HardCycleMazes=cyc, HardMultiShortest=multi_sp,
+                       HardShortestMin=int(k.min()), HardShortestMedianMillions=round(float(np.median(k)) / 1e6, 1))
+        rows_out += [["Maze-Hard (test)", f"{len(X):,}", f"{cyc:,}", "--", "--",
+                      f"median {np.median(k) / 1e6:.1f}M (min {int(k.min())})"]]
+    else:
+        pending("A1", "tables/tab_task_properties.tex", "data/maze-30x30-hard-1k missing (python -m trm.data.build_maze_dataset)")
+    if rows_out:
+        write_table("tab_task_properties",
+                    ["Task", "Mazes", "With cycles", "$\\geq$2 checkpoints", "R/N change route", "Shortest routes"],
+                    rows_out, "A1", "Structural properties of the two maze tasks",
+                    colspec="lrrrrr",
+                    notes="custom mazes are trees: the valid route is the unique minimal subtree "
+                          "spanning S, G and every C, so exact match = valid-and-shortest there")
+
+
+# --- E1/E5: Maze-Hard baseline ---
+def baseline():
+    d = RES / "maze_hard_baseline"
+    if not (d / "verdicts.jsonl").exists():
+        pending("E1, E5", "figures/fig_baseline_outcomes.pdf", "run scripts/katana/rescore_baseline.pbs")
+        return
+    V = load_verdicts(d / "verdicts.jsonl")
+    n = len(V)
+    c = outcome_counts(V)
+    longer = [v for v in V if v["category"] == "valid_longer"]
+    excess = Counter(v["pred_steps"] - v["opt_steps"] for v in longer)
+    broken = [v for v in V if v["category"] == "broken"]
+    reasons = Counter(v["reasons"][0]["code"] for v in broken)
+
+    numbers.update(
+        BaselineN=n, BaselineExact=c["exact"] / n, BaselineAltShortest=c["alt_shortest"],
+        BaselineValidShortest=(c["exact"] + c["alt_shortest"]) / n,
+        BaselineLonger=c["longer"], BaselineBroken=c["broken"], BaselineFailures=n - c["exact"],
+        BaselineAltShareOfFailures=c["alt_shortest"] / max(n - c["exact"], 1),
+        BaselineLongerPlusTwo=excess.get(2, 0),
+    )
+
+    # table: outcomes with Wilson CIs
+    rows = []
+    for key, label in OUTCOMES_TEX:
+        lo, hi = wilson(c[key], n)
+        rows.append([label, c[key], pct(c[key] / n), f"[{pct(lo)}, {pct(hi)}]"])
+    vs = c["exact"] + c["alt_shortest"]
+    lo, hi = wilson(vs, n)
+    rows.append(["\\midrule Valid and shortest (any)", vs, pct(vs / n), f"[{pct(lo)}, {pct(hi)}]"])
+    write_table("tab_baseline_outcomes", ["Outcome", "Mazes", "Share", "95\\% CI (Wilson)"], rows,
+                "E1, E5", f"Published Maze-Hard checkpoint on the {n} test mazes, by checker verdict")
+
+    write_table("tab_baseline_failure_detail", ["Failure detail", "Mazes"],
+                [[f"Valid, longer by +{k} steps", excess[k]] for k in sorted(excess)]
+                + [[f"Broken: {code.replace('_', ' ')}", k] for code, k in reasons.most_common()],
+                "E5", "Breakdown of the non-shortest failures (excess length; first broken reason)")
+
+    # figure: (a) outcomes, (b) excess length of valid-but-longer routes
+    fig, (a, b) = plt.subplots(1, 2, figsize=(WIDTH, 2.3), gridspec_kw={"width_ratios": [1.35, 1.15]})
+    fig.subplots_adjust(left=0.24, right=0.98, bottom=0.2, top=0.9, wspace=0.42)
+    labels = [lab for _, lab in OUTCOMES]
+    vals = [c[k] / n for k, _ in OUTCOMES]
+    a.set_xlim(0, 1.0); a.set_ylim(len(labels) - 0.5, -0.5)
+    a.set_yticks(range(len(labels)), labels)
+    style_axes(a, pct_y=False, grid_axis="x")
+    a.xaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+    a.tick_params(axis="y", length=0)
+    for i, (key, _) in enumerate(OUTCOMES):
+        rounded_bar(a, 0, vals[i], i, 0.55, SERIES[0])
+        a.text(vals[i] + 0.015, i, f"{c[key]} ({vals[i]:.1%})", va="center", fontsize=8, color=INK)
+    a.set_xlabel(f"share of {n:,} Maze-Hard test mazes")
+    a.set_title("(a) checker verdict", fontsize=9, color=INK, loc="left")
+
+    ks = sorted(excess)
+    b.set_xlim(-0.6, len(ks) - 0.4); b.set_ylim(0, max(excess.values()) * 1.18)
+    style_axes(b, pct_y=False)
+    for i, k in enumerate(ks):
+        rounded_bar(b, 0, excess[k], i, 0.6, SERIES[0], horizontal=False)
+        b.text(i, excess[k] + max(excess.values()) * 0.03, str(excess[k]), ha="center", fontsize=8, color=INK)
+    b.set_xticks(range(len(ks)), [f"+{k}" for k in ks], fontsize=7.5)
+    b.set_xlabel("extra steps vs. optimal route")
+    b.set_ylabel("mazes")
+    b.set_title("(b) valid-but-longer routes", fontsize=9, color=INK, loc="left")
+    save(fig, "fig_baseline_outcomes", "E1, E5",
+         "Maze-Hard baseline: checker verdicts and excess length of longer routes")
+
+
+# --- E3: vocabulary transplant check ---
+def transplant():
+    d = RES / "diagnostics"
+    ctl, exp = d / "t0_control.json", d / "t0_expanded.json"
+    if not (ctl.exists() and exp.exists()):
+        pending("E3", "tables/tab_transplant.tex", "run scripts/katana/transplant_check.pbs")
+        return
+    rows = []
+    for path, label in ((ctl, "Original (6 tokens)"), (exp, "Expanded (11 tokens)")):
+        j = json.load(open(path))
+        rows.append([label, pct(j["exact_accuracy"]), pct(j["accuracy"], 2), f"{j['lm_loss']:.3f}"])
+        numbers["TzeroControl" if path == ctl else "TzeroExpanded"] = j["exact_accuracy"]
+    write_table("tab_transplant", ["Checkpoint", "Exact match", "Token accuracy", "LM loss"], rows, "E3",
+                "Maze-Hard accuracy before/after vocabulary expansion, no fine-tuning")
+
+
+# --- E2: first run (from scratch) ---
+def first_run():
+    d = RES / "first_run"
+    if not (d / "verdicts.jsonl").exists():
+        pending("E2", "tables/tab_first_run.tex", "run scripts/katana/rescore_first_run.pbs")
+        return None
+    V = load_verdicts(d / "verdicts.jsonl")
+    c = outcome_counts(V)
+    numbers["FirstRunExact"] = c["exact"] / len(V)
+    reasons = Counter(r["code"] for v in V if v["category"] == "broken" for r in v["reasons"])
+    rows = [[label, c[k], pct(c[k] / len(V))] for k, label in OUTCOMES_TEX]
+    rows += [[f"\\quad broken, any reason: {code.replace('_', ' ')}", k, pct(k / len(V))]
+             for code, k in reasons.most_common(5)]
+    write_table("tab_first_run", ["Outcome", "Mazes", "Share"], rows, "E2",
+                "First custom-maze run (random init, batch 1) on the 1,000-maze eval set")
+    return c, len(V)
+
+
+# --- E4: v4 fine-tune (history) ---
+V4_ROWS, V4_REAL = 112, 100   # 100 test mazes padded to 112 rows (EXPERIMENTS.md M1)
+V4_PADDED = ["path/connected", "path/has_endpoints", "path/valid", "path/optimal"]
+
+
+def v4():
+    p = RES / "v4_finetune" / "eval_metrics.csv"
+    if not p.exists():
+        pending("E4", "figures/fig_v4_curves.pdf", "results/v4_finetune/eval_metrics.csv missing")
+        return None
+    rows = list(csv.DictReader(open(p)))
+    f = lambda r, k: float(r[k])
+    for r in rows:   # undo padding dilution (padding rows score 0 on these)
+        for k in (k for k in V4_PADDED if k in r):
+            r[k + "_corrected"] = f(r, k) * V4_ROWS / V4_REAL
+    step = np.array([int(r["step"]) for r in rows])
+    exact = np.array([f(r, "all/exact_accuracy") for r in rows])
+    conn = np.array([r["path/connected_corrected"] for r in rows])
+    assert (conn + 1e-6 >= exact).all(), "corrected connectivity below exact match -- correction wrong"
+
+    best = int(exact.argmax())
+    gap = conn - exact
+    numbers.update(VfourBestExact=exact[best], VfourBestStep=int(step[best]),
+                   VfourFinalExact=exact[-1], VfourFinalStep=int(step[-1]),
+                   VfourFirstExact=exact[0], VfourFirstStep=int(step[0]),
+                   VfourFinalConnected=conn[-1], VfourMaxConnectedGap=float(gap.max()),
+                   VfourMaxConnectedGapStep=int(step[int(gap.argmax())]))
+
+    write_table("tab_v4_trajectory",
+                ["Step", "Epoch", "Exact", "Connected$^\\dagger$", "C tiles kept$^\\ddagger$", "Token acc."],
+                [[int(r["step"]), int(float(r["epoch"])), pct(f(r, "all/exact_accuracy"), 0),
+                  pct(r["path/connected_corrected"], 0), pct(f(r, "path/all_checkpoints"), 0),
+                  pct(f(r, "all/accuracy"), 2)] for r in rows],
+                "E4", "v4 fine-tune trajectory (100-maze test set)",
+                notes="dagger: corrected for padding rows (x112/100); ddagger: old 'all_checkpoints' "
+                      "metric, counts a C tile copied to the output as visited -- not a routing "
+                      "measure. See docs/EXPERIMENTS.md E4.")
+
+    fig, ax = plt.subplots(figsize=(WIDTH, 2.6))
+    fig.subplots_adjust(left=0.1, right=0.97, bottom=0.17, top=0.88)
+    series = [(exact, "Exact match"), (conn, "Single connected S–G route (corrected for padding)")]
+    for i, (y, lab) in enumerate(series):
+        ax.plot(step, y, LINESTYLES[i], color=SERIES[i], marker=MARKERS[i], ms=5,
+                mec="white", mew=1.0, label=lab)
+    ax.fill_between(step, exact, conn, color=SERIES[1], alpha=0.10, lw=0)
+    g = int(gap.argmax())
+    ax.annotate(f"connected but not exact:\n{gap[g]:.0%} of mazes at step {step[g]:,}",
+                (step[g], (exact[g] + conn[g]) / 2), xytext=(14, -22), textcoords="offset points",
+                fontsize=8, color=INK2, arrowprops=dict(arrowstyle="-", color=AXIS, lw=0.8))
+    ax.set_ylim(0, 1.05); ax.set_xlim(0, step[-1] * 1.03)
+    style_axes(ax)
+    ax.set_xlabel("training step"); ax.set_ylabel("share of test mazes")
+    ax.legend(frameon=False, loc="lower left", bbox_to_anchor=(0, 1.0), ncol=2, fontsize=7.5,
+              handlelength=2.6, columnspacing=1.5)
+    save(fig, "fig_v4_curves", "E4", "v4 fine-tune: exact match vs. connected route (100-maze test set)")
+    return step, exact
+
+
+# --- E6/E7: seed runs on the 1k eval set ---
+def run_info(run_dir):
+    cfg = yaml.safe_load(open(run_dir / "all_config.yaml"))
+    data = cfg["data_paths"][0]
+    meta = ROOT / data / "train" / "dataset.json"
+    n_train = json.load(open(meta))["total_groups"] if meta.exists() else None
+    return dict(run=run_dir.name, seed=cfg["seed"], batch=cfg["global_batch_size"], lr=cfg["lr"],
+                n_train=n_train, data=data)
+
+
+def config_label(i):
+    tag = " (v4 replica)" if (i["n_train"], i["batch"]) == (500, 16) else ""
+    return f"{i['n_train']:,} mazes, batch {i['batch']}{tag}"
+
+
+def finetune(v4_curve, first):
+    runs = sorted(p for p in (RES / "finetune").glob("*") if (p / "eval_metrics.jsonl").exists()
+                  and (p / "all_config.yaml").exists())
+    runs = [r for r in runs if (r / "eval_metrics.jsonl").stat().st_size > 0]
+    if not runs:
+        pending("E6, E7", "figures/fig_finetune_curves.pdf", "seed runs not finished; pull with scripts/katana/pull_results.sh")
+        return
+    info = {r: run_info(r) for r in runs}
+    evals = {r: [json.loads(l) for l in open(r / "eval_metrics.jsonl") if l.strip()] for r in runs}
+    groups = {}
+    for r in runs:
+        groups.setdefault(config_label(info[r]), []).append(r)
+    groups = dict(sorted(groups.items(), key=lambda kv: (info[kv[1][0]]["n_train"], info[kv[1][0]]["batch"])))
+
+    # table: per run
+    rows = []
+    for label, rs in groups.items():
+        for r in sorted(rs, key=lambda r: info[r]["seed"]):
+            E = evals[r]
+            ex = np.array([e["all/exact_accuracy"] for e in E])
+            hit = next((e["step"] for e in E if e["all/exact_accuracy"] >= 0.9), None)
+            last = E[-1]
+            g = lambda k: pct(last.get(k, float("nan")))
+            rows.append([f"{info[r]['n_train']:,}", info[r]["batch"],
+                         f"{info[r]['seed']}" + ("" if (r / "DONE").exists() else "*"),
+                         f"{pct(ex.max())} ({E[int(ex.argmax())]['step']:,})",
+                         g("all/exact_accuracy"), g("path/verdict/valid_shortest"),
+                         g("path/verdict/valid_longer"), g("path/verdict/broken"),
+                         g("path/reaches_all_checkpoints"), f"{hit:,}" if hit else "--"])
+    write_table("tab_finetune_runs",
+                ["Mazes", "Batch", "Seed", "Best exact (step)", "Exact", "Shortest", "Longer", "Broken",
+                 "All C reached", "Step $\\geq$90\\%"], rows, "E6, E7",
+                "Per-run results on the 1,000-maze eval set (final = last eval)", colspec="rrrrrrrrrr",
+                super_header=" & & & & \\multicolumn{5}{c}{Final checkpoint} & \\\\ \\cmidrule(lr){5-9}",
+                notes="* = run still in progress when the report was built; "
+                      "Shortest/Longer/Broken are checker verdicts (Shortest includes exact matches)")
+
+    # numbers: per-config mean of final values
+    for label, rs in groups.items():
+        key = "FtReplica" if "replica" in label else "FtScale"
+        fin = [evals[r][-1] for r in rs]
+        numbers[key + "FinalExactMean"] = float(np.mean([e["all/exact_accuracy"] for e in fin]))
+        numbers[key + "FinalValidShortestMean"] = float(np.mean([e.get("path/verdict/valid_shortest", np.nan) for e in fin]))
+        numbers[key + "Seeds"] = len(rs)
+
+    # figure: learning curves, mean over seeds with min-max band
+    fig, axes = plt.subplots(1, 2, figsize=(WIDTH, 2.6), sharey=True, sharex=True)
+    fig.subplots_adjust(left=0.09, right=0.98, bottom=0.3, top=0.9, wspace=0.08)
+    for ax, key, title in ((axes[0], "all/exact_accuracy", "(a) exact match"),
+                           (axes[1], "path/verdict/valid_shortest", "(b) valid & shortest (checker)")):
+        for gi, (label, rs) in enumerate(groups.items()):
+            common = sorted(set.intersection(*[{e["step"] for e in evals[r]} for r in rs]))
+            Y = np.array([[next(e[key] for e in evals[r] if e["step"] == s) for s in common] for r in rs])
+            ax.fill_between(common, Y.min(0), Y.max(0), color=SERIES[gi], alpha=0.12, lw=0)
+            ax.plot(common, Y.mean(0), LINESTYLES[gi], color=SERIES[gi],
+                    label=f"{label}, mean of {len(rs)} seed{'s' if len(rs) > 1 else ''}")
+        if key == "all/exact_accuracy" and v4_curve is not None:
+            ax.plot(*v4_curve, ":", color=NEUTRAL, marker="o", ms=3, label="v4 (different 100-maze test set)")
+        style_axes(ax)
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("training step")
+        ax.set_title(title, fontsize=9, color=INK, loc="left")
+    axes[0].set_ylabel("share of eval mazes")
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, frameon=False, loc="lower center", ncol=2, bbox_to_anchor=(0.53, -0.02))
+    save(fig, "fig_finetune_curves", "E6, E7",
+         "Fine-tune learning curves on the 1,000-maze eval set; band = range over seeds")
+
+    # figure: final verdict composition per run (+ first run for reference)
+    bars = []
+    if first is not None:
+        c, n = first
+        bars.append(("First run (random init)", [c[k] / n for k, _ in OUTCOMES]))
+    for label, rs in groups.items():
+        for r in sorted(rs, key=lambda r: info[r]["seed"]):
+            fv = r / "final_verdicts.jsonl"
+            if fv.exists():
+                V = load_verdicts(fv)
+                c = outcome_counts(V)
+                bars.append((f"{label}, seed {info[r]['seed']}", [c[k] / len(V) for k, _ in OUTCOMES]))
+    if bars:
+        height = 0.42 * len(bars) + 1.0
+        fig, ax = plt.subplots(figsize=(WIDTH, height))
+        fig.subplots_adjust(left=0.42, right=0.97, bottom=0.5 / height, top=1 - 0.4 / height)
+        ax.set_xlim(0, 1); ax.set_ylim(len(bars) - 0.5, -0.5)
+        for i, (_, parts) in enumerate(bars):
+            x = 0.0
+            for j, frac in enumerate(parts):
+                if frac <= 0:
+                    continue
+                last_seg = all(p <= 0 for p in parts[j + 1:])
+                if last_seg:
+                    rounded_bar(ax, x, x + frac, i, 0.6, ORDINAL[j])
+                else:
+                    ax.barh(i, frac, left=x, height=0.6, color=ORDINAL[j], edgecolor="white", linewidth=1.2)
+                x += frac
+        ax.set_yticks(range(len(bars)), [b[0] for b in bars])
+        ax.tick_params(axis="y", length=0)
+        style_axes(ax, pct_y=False, grid_axis="x")
+        ax.xaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+        ax.set_xlabel("share of the 1,000 eval mazes at the final checkpoint")
+        handles = [plt.Rectangle((0, 0), 1, 1, color=ORDINAL[j]) for j in range(len(OUTCOMES))]
+        ax.legend(handles, [lab for _, lab in OUTCOMES], frameon=False, ncol=4, loc="lower left",
+                  bbox_to_anchor=(-0.02, 1.0), fontsize=7.5, handlelength=1.2, columnspacing=1.0)
+        save(fig, "fig_finetune_final_verdicts", "E2, E6, E7",
+             "Final-checkpoint outcome composition per run (checker verdicts)")
+    pending_runs = [r.name for r in runs if not (r / "DONE").exists()]
+    if pending_runs:
+        manifest.append(("E6, E7", "(runs)", "still running: " + ", ".join(pending_runs), "partial"))
+
+
+# --- main ---
+def write_numbers():
+    def fmt(k, v):
+        if isinstance(v, float) and 0 <= v <= 1 and not k.endswith(("Step", "Seeds", "N", "Millions")):
+            return f"{100 * v:.1f}\\%"
+        return f"{v:,}" if isinstance(v, int) else f"{v}"
+    lines = ["% Generated by scripts/make_report.py -- \\input{report/numbers.tex}"]
+    lines += [f"\\newcommand{{\\{k}}}{{{fmt(k, v)}}}" for k, v in sorted(numbers.items())]
+    (OUT / "numbers.tex").write_text("\n".join(lines) + "\n")
+    (OUT / "numbers.json").write_text(json.dumps(numbers, indent=1, default=float) + "\n")
+
+
+def write_manifest():
+    lines = ["# Thesis outputs", "",
+             "Generated by `python scripts/make_report.py` from `results/` — do not edit by hand.",
+             "Experiment IDs refer to [docs/EXPERIMENTS.md](../docs/EXPERIMENTS.md).", "",
+             "| Experiment | Output | Content | Status |", "|---|---|---|---|"]
+    lines += [f"| {e} | `{o}` | {d} | {s} |" for e, o, d, s in manifest]
+    lines += ["", "LaTeX: `\\usepackage{booktabs}`, then `\\input{report/tables/<name>.tex}` inside a",
+              "`table` environment, `\\includegraphics{report/figures/<name>.pdf}` inside a `figure`,",
+              "and `\\input{report/numbers.tex}` in the preamble for inline numbers (e.g. `\\BaselineExact`)."]
+    (OUT / "README.md").write_text("\n".join(lines) + "\n")
+
+
+def main():
+    if OUT.exists():
+        shutil.rmtree(OUT)
+    (OUT / "figures").mkdir(parents=True)
+    (OUT / "tables").mkdir()
+    task_properties()
+    baseline()
+    transplant()
+    first = first_run()
+    curve = v4()
+    finetune(curve, first)
+    write_numbers()
+    write_manifest()
+    for e, o, d, s in manifest:
+        print(f"[{s:9s}] {e:10s} {o}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+{
+  "exact_accuracy": 0.8519999980926514,
+  "accuracy": 0.9951755404472351,
+  "lm_loss": 0.032887592911720276,
+  "q_halt_accuracy": 0.8539999723434448,
+  "steps": 16.0,
+  "transplanted": false,
+  "model_vocab": 6,
+  "data_vocab": 6,
+  "vocab_keys": [
+    "model.inner.embed_tokens.embedding_weight",
+    "model.inner.lm_head.weight"
+  ],
+  "ckpt": "checkpoints/maze/maze_hard_step_32550",
+  "data": "data/maze-30x30-hard-1k",
+  "git_sha": "92dc7f4"
+}

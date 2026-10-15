@@ -1,0 +1,19 @@
+#!/bin/bash
+# E3: Maze-Hard accuracy of the original and vocab-expanded checkpoints, no fine-tuning.
+#PBS -N trm-t0
+#PBS -l select=1:ncpus=8:ngpus=1:mem=48gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+set -euo pipefail
+cd $HOME/thesis/trm
+source scripts/katana/env.sh
+OUT=results/diagnostics
+mkdir -p $OUT
+exec > $OUT/t0_job.log 2>&1
+hostname; nvidia-smi --query-gpu=name --format=csv,noheader
+python -m trm.diagnostics.t0_zero_step --ckpt checkpoints/maze/maze_hard_step_32550 \
+  --config config/resolved/maze_hard_pretrained.yaml --data data/maze-30x30-hard-1k \
+  --no-transplant --global-batch-size 250 --out $OUT/t0_control.json
+python -m trm.diagnostics.t0_zero_step --ckpt checkpoints/maze/maze_hard_step_32550_expanded.pt \
+  --config config/resolved/maze_hard_pretrained.yaml --data data/maze-30x30-hard-1k \
+  --v-old 11 --no-transplant --global-batch-size 250 --out $OUT/t0_expanded.json

@@ -1,0 +1,18 @@
+#!/bin/bash
+# E2: first custom-maze run (step 25000) on the 1,000-maze eval set, scored with the route checker.
+#PBS -N trm-rescore1
+#PBS -l select=1:ncpus=8:ngpus=1:mem=48gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+set -euo pipefail
+cd $HOME/thesis/trm
+source scripts/katana/env.sh
+OUT=results/first_run
+mkdir -p $OUT
+exec > $OUT/job.log 2>&1
+hostname; nvidia-smi --query-gpu=name --format=csv,noheader
+python scripts/rescore_maze_preds.py \
+  --checkpoint checkpoints/maze-custom-first-run/step_25000 \
+  --config config/resolved/maze_custom_first_run.yaml \
+  --dataset data/maze-custom-eval1k \
+  --outdir $OUT

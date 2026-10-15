@@ -1,5 +1,25 @@
 # Less is More: Recursive Reasoning with Tiny Networks
 
+> **Thesis extension (Joel Lum, UNSW, 2026).** This fork adapts the TRM Maze-Hard
+> model to mazes with mandatory checkpoints and reward/penalty tiles.
+>
+> | What | Where |
+> |---|---|
+> | Each experiment's rationale, setup, findings, caveats | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) |
+> | Thesis figures, LaTeX tables, inline-number macros | [report/](report/README.md), rebuilt by `python scripts/make_report.py` |
+> | Raw experiment outputs (no weights) | `results/` |
+> | Running on UNSW Katana | [scripts/katana/README.md](scripts/katana/README.md) |
+>
+> Code added for the thesis:
+> - `src/trm/data/custom/`: maze generator, solver and dataset builder
+> - `src/trm/evaluation/maze_checker.py`: route checker
+> - `src/trm/evaluation/maze_path.py`: in-training evaluator
+> - `src/trm/diagnostics/`: vocabulary expansion check
+> - `scripts/build_maze_splits.py`, `scripts/expand_checkpoint_vocab.py`, `scripts/rescore_maze_preds.py`, `scripts/make_report.py`
+> - `config/resolved/`: configs of the checkpoints used
+>
+> The rest of this README is the upstream TRM documentation.
+
 This is the codebase for the paper: "Less is More: Recursive Reasoning with Tiny Networks". TRM is a recursive reasoning approach that achieves amazing scores of 45% on ARC-AGI-1 and 8% on ARC-AGI-2 using a tiny 7M parameters neural network.
 
 [Paper](https://www.alphaxiv.org/abs/2510.04871)
@@ -235,7 +255,7 @@ torchrun --nproc-per-node 1 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nn
 ## Reproducing paper numbers
 
 - Build the exact datasets above (`arc1concept-aug-1000`, `arc2concept-aug-1000`, `maze-30x30-hard-1k`, `sudoku-extreme-1k-aug-1000`).
-- Use the training commands in this README (matching `scripts/cmd.sh` but with minor fixes like line breaks and env-safe flags).
+- Use the training commands in this README.
 - Keep seeds at defaults (`seed=0` in `config/cfg_pretrain.yaml`); runs are deterministic modulo CUDA kernels.
 - Evaluate with `scripts/run_eval_only.py` and report `exact_accuracy` and per-task metrics. The script will compute Wilson 95% CI when dataset metadata is present.
 

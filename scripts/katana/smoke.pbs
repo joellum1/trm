@@ -1,0 +1,59 @@
+#!/bin/bash
+# Pre-flight: GPU, network, adam_atan2 build, vocab expansion, and a tiny
+# train -> eval -> checkpoint -> kill -> resume cycle. Exits non-zero on failure,
+# so real runs can wait on it with qsub -W depend=afterok:<job>.
+#PBS -N trm-smoke
+#PBS -l select=1:ncpus=8:ngpus=1:mem=48gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -uo pipefail
+cd $HOME/thesis/trm
+source scripts/katana/env.sh
+exec > $SCRATCH/trm/logs/smoke.${PBS_JOBID:-local}.log 2>&1
+set -x
+hostname; nvidia-smi
+curl -sS -o /dev/null -w "huggingface.co -> %{http_code}\n" --max-time 15 https://huggingface.co || echo "NO OUTBOUND NETWORK"
+
+INIT=checkpoints/maze/maze_hard_step_32550_expanded.pt
+[ -f $INIT ] || python scripts/expand_checkpoint_vocab.py \
+  --old-checkpoint checkpoints/maze/maze_hard_step_32550 \
+  --new-config config/resolved/maze_custom_first_run.yaml \
+  --dataset data/maze-custom --output $INIT || exit 1
+
+rm -rf checkpoints/smoke
+ARGS=(arch=trm arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=4
+  data_paths="[data/maze-custom]" data_paths_test="[data/maze-custom-eval1k]"
+  evaluators="[{name: maze_path@MazePath}]" +load_checkpoint=$INIT
+  global_batch_size=160 epochs=2 eval_interval=2 lr=1e-4 lr_warmup_steps=20 lr_min_ratio=1.0
+  weight_decay=1.0 puzzle_emb_weight_decay=1.0 puzzle_emb_lr=1e-4 ema=True seed=0
+  eval_every_steps=20 checkpoint_every_steps=25 resume=True
+  +project_name=smoke +run_name=smoke +checkpoint_path=checkpoints/smoke)
+# Kill after step 50's checkpoint, then resume to the end (62 steps).
+timeout 1500 python scripts/train.py "${ARGS[@]}" &
+PID=$!
+while kill -0 $PID 2>/dev/null; do
+  [ -f checkpoints/smoke/last.pt ] && [ -f checkpoints/smoke/step_50 ] && { sleep 1; kill $PID; break; }
+  sleep 2
+done
+wait $PID
+echo "--- resuming ---"
+python scripts/train.py "${ARGS[@]}"
+ls -la checkpoints/smoke
+set +x
+# Expect evals at 20, 40 (first run), 60, 62 (resumed); step files 25, 50, 62.
+python - <<'PY'
+import json, os, sys
+d = "checkpoints/smoke"
+evals = [json.loads(l) for l in open(f"{d}/eval_metrics.jsonl")]
+for j in evals:
+    print(j["step"], round(j["all/exact_accuracy"], 4),
+          {k.split("/")[-1]: round(v, 3) for k, v in j.items() if k.startswith("path/verdict")})
+steps = [j["step"] for j in evals]
+ok = (steps == [20, 40, 60, 62]
+      and all(os.path.exists(f"{d}/step_{n}") for n in (25, 50, 62))
+      and os.path.exists(f"{d}/last.pt")
+      and os.path.exists(f"{d}/evaluator_MazePath_step_62/verdicts.jsonl")
+      and all("path/verdict/valid_shortest" in j for j in evals))
+print("SMOKE PASS" if ok else f"SMOKE FAIL (eval steps {steps})")
+sys.exit(0 if ok else 1)
+PY

@@ -1,0 +1,6 @@
+Outcome,Mazes,Share,95% CI (Wilson)
+Exact match,852,85.2%,"[82.9%, 87.3%]"
+"Valid, shortest (≠ label)",64,6.4%,"[5.0%, 8.1%]"
+"Valid, longer",76,7.6%,"[6.1%, 9.4%]"
+Broken,8,0.8%,"[0.4%, 1.6%]"
+Valid and shortest (any),916,91.6%,"[89.7%, 93.2%]"

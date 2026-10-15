@@ -1,3 +1,5 @@
+# First custom-maze run (E2); also the architecture spec for expand_checkpoint_vocab.py.
+# load_checkpoint: null -- it trained from random initialisation.
 arch:
   H_cycles: 3
   H_layers: 0

@@ -1,0 +1,10 @@
+Outcome,Mazes,Share
+Exact match,0,0.0%
+"Valid, shortest (≠ label)",0,0.0%
+"Valid, longer",0,0.0%
+Broken,1000,100.0%
+"  broken, any reason: missed checkpoint",992,99.2%
+"  broken, any reason: disconnected",959,95.9%
+"  broken, any reason: stray cells",38,3.8%
+"  broken, any reason: tile altered",8,0.8%
+"  broken, any reason: goal missing",3,0.3%

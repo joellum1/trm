@@ -1,40 +1,17 @@
-"""Transplant weights from an old checkpoint into a new (differently-shaped)
-architecture -- specifically for the case where fine-tuning added new maze
-tile types (checkpoint/reward/penalty), so the token embedding and output
-head are a different size than the pretrained checkpoint.
+"""Copy a checkpoint into an architecture with a larger vocabulary (6 -> 11 maze tiles).
 
-For every parameter:
-  - identical shape  -> copied over exactly
-  - shape differs only in size (e.g. vocab dim grew from 6 -> 11) -> the
-    overlapping region is copied (old tile types keep their learned weights),
-    the rest is left at its fresh random initialization (new tile types start
-    from scratch, same as any newly-added layer would)
-  - key only exists in the new model -> left as fresh random init
-  - key only exists in the old checkpoint -> FATAL (the two configs are not
-    the same architecture family)
+  same shape          copied
+  larger vocab dim    old rows copied, new rows keep fresh random init
+  only in new model   fresh random init
+  only in old ckpt    fatal (different architecture)
 
-The overlap copy is only meaningful if the original token ids did not move,
-i.e. NEW_CHARSET starts with OLD_CHARSET. That is asserted up front: without
-it this script will happily copy learned embeddings into positions that now
-mean something else and report success.
+Only valid if the new charset starts with the old one (token ids unchanged); asserted.
 
-Usage:
-    python scripts/expand_checkpoint_vocab.py \\
-        --old-checkpoint checkpoints/maze/maze_hard_step_32550 \\
-        --new-config checkpoints/maze-custom/all_config.yaml \\
-        --dataset data/maze-custom \\
+    python scripts/expand_checkpoint_vocab.py --old-checkpoint checkpoints/maze/maze_hard_step_32550 \\
+        --new-config config/resolved/maze_custom_first_run.yaml --dataset data/maze-custom \\
         --output checkpoints/maze/maze_hard_step_32550_expanded.pt
 
-Then launch training with:
-    +load_checkpoint=checkpoints/maze/maze_hard_step_32550_expanded.pt
-
-Validate the result before trusting it (expect exact_accuracy ~0.8510):
-    python -m trm.diagnostics.t0_zero_step \\
-        --ckpt checkpoints/maze/maze_hard_step_32550_expanded.pt \\
-        --config config/t0_zero_step.yaml \\
-        --data data/maze-30x30-hard-1k \\
-        --v-old 11 --no-transplant \\
-        --out results/t0_expanded.json
+Check it still solves Maze-Hard (85.2% exact) with scripts/katana/transplant_check.pbs.
 """
 
 import os
@@ -50,13 +27,10 @@ import torch
 
 from trm.training import PretrainConfig, create_dataloader, init_train_state
 
-# Frozen literal: the vocabulary the pretrained maze checkpoint was trained
-# under. This is a historical fact and must never be imported from a module
-# that could change alongside it.
+# Frozen literal (the pretrained checkpoint's vocabulary); never import it.
 PRETRAINED_CHARSET = "# SGo"
 
-# Exactly these should change shape when growing the vocabulary. Anything
-# else changing shape means something unexpected is vocab-dependent.
+# The only tensors expected to change shape.
 EXPECTED_PARTIAL = {
     'model.inner.embed_tokens.embedding_weight',
     'model.inner.lm_head.weight',
@@ -201,8 +175,7 @@ def main():
 
     unmatched_old = [k for k in old_state if k not in new_state]
 
-    # The fresh model lives on CUDA; old_state was loaded to CPU. Normalise
-    # everything to CPU so comparisons work and the saved file is portable.
+    # Fresh model is on CUDA, old_state on CPU: compare and save on CPU.
     merged = {k: v.detach().cpu() for k, v in merged.items()}
 
     # ---------------------------------------------------------------- report

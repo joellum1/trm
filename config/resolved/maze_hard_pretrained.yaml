@@ -1,0 +1,64 @@
+# Resolved config of the published Maze-Hard checkpoint (maze_hard_step_32550), loaded
+# with plain yaml.safe_load: no Hydra `defaults:` or ${...} interpolation.
+# L_cycles must be 4 (config/arch/trm.yaml says 6): cycle counts change no tensor
+# shapes, so a mismatch loads cleanly and silently runs the wrong recursion depth.
+
+arch:
+  name: architectures.trm@TinyRecursiveReasoningModel_ACTV1
+  loss:
+    name: losses@ACTLossHead
+    loss_type: stablemax_cross_entropy
+
+  halt_exploration_prob: 0.1
+  halt_max_steps: 16
+
+  H_cycles: 3
+  L_cycles: 4
+  H_layers: 0
+  L_layers: 2
+
+  hidden_size: 512
+  num_heads: 8
+  expansion: 4
+
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  mlp_t: false
+  no_ACT_continue: true
+
+# Overridden by the scripts that load this file.
+data_paths: ['data/maze-30x30-hard-1k']
+data_paths_test: ['data/maze-30x30-hard-1k']
+evaluators: []
+
+# Eval only; PretrainConfig requires the training fields.
+global_batch_size: 32
+epochs: 1
+eval_interval: 1
+min_eval_interval: 0
+checkpoint_every_eval: false
+eval_save_outputs: []
+
+lr: 2.0e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 4000
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_weight_decay: 1.0
+puzzle_emb_lr: 1.0e-4
+
+seed: 0
+freeze_weights: false
+
+# step_32550 holds EMA weights (reproduces 85.2% exact, docs/EXPERIMENTS.md E1).
+ema: true
+ema_rate: 0.999
+
+load_checkpoint: null
+checkpoint_path: checkpoints/t0_zero_step
+project_name: T0-diagnostic
+run_name: zero_step_eval

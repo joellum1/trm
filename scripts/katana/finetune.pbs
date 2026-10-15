@@ -1,0 +1,58 @@
+#!/bin/bash
+# Custom-maze fine-tune from the expanded checkpoint: eval every 100 steps, checkpoint every 250.
+#   qsub -v SEED=0[,BATCH=16,TRAIN_DATA=data/maze-custom-train500] scripts/katana/finetune.pbs
+# Resubmitting the same run resumes from last.pt. Code is frozen into <run>/code on
+# first start, so syncing new code never changes a queued or running run.
+#PBS -N trm-ft
+#PBS -l select=1:ncpus=8:ngpus=1:mem=48gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+set -euo pipefail
+cd $HOME/thesis/trm
+source scripts/katana/env.sh
+
+SEED=${SEED:-0}
+LR=${LR:-1e-4}
+BATCH=${BATCH:-160}
+EPOCHS=${EPOCHS:-150}
+WARMUP=${WARMUP:-200}
+TRAIN_DATA=${TRAIN_DATA:-data/maze-custom}
+N_TRAIN=$(python -c "import json;print(json.load(open('$TRAIN_DATA/train/dataset.json'))['total_groups'])")
+RUN=${RUN:-ft_custom_n${N_TRAIN}_lr${LR}_b${BATCH}_s${SEED}}
+HF_REPO=${HF_REPO-joellum1/trm-maze-finetune}   # HF_REPO= (empty) disables uploads
+PROJECT=Maze-custom-finetune
+CKPT_DIR=checkpoints/$PROJECT/$RUN
+INIT=checkpoints/maze/maze_hard_step_32550_expanded.pt
+
+mkdir -p $CKPT_DIR
+exec >> $CKPT_DIR/job.log 2>&1
+echo "=== $(date) job ${PBS_JOBID:-local} on $(hostname) ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+[ -f $CKPT_DIR/DONE ] && { echo "already finished"; exit 0; }
+[ -f $INIT ] || { echo "missing $INIT (run scripts/katana/smoke.pbs first)"; exit 1; }
+
+CODE=$PWD/$CKPT_DIR/code
+if [ ! -d $CODE ]; then
+  mkdir -p $CODE && cp -r src scripts config $CODE/
+  find $CODE -name __pycache__ -prune -exec rm -rf {} +
+  echo "froze code -> $CODE"
+fi
+export PYTHONPATH=$CODE/src   # ahead of the editable install of ~/thesis/trm/src
+export TORCH_EXTENSIONS_DIR=$CODE/.torch_extensions   # adam_atan2 builds once per run (~3 min)
+python -c "import trm, sys; assert trm.__file__.startswith('$CODE'), trm.__file__"
+
+python $CODE/scripts/train.py \
+  arch=trm arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=4 \
+  data_paths="[$TRAIN_DATA]" data_paths_test="[data/maze-custom-eval1k]" \
+  evaluators="[{name: maze_path@MazePath}]" \
+  +load_checkpoint=$INIT \
+  global_batch_size=$BATCH epochs=$EPOCHS eval_interval=$EPOCHS \
+  lr=$LR lr_warmup_steps=$WARMUP lr_min_ratio=1.0 \
+  weight_decay=1.0 puzzle_emb_weight_decay=1.0 puzzle_emb_lr=1e-4 \
+  ema=True seed=$SEED \
+  eval_every_steps=100 checkpoint_every_steps=250 resume=True \
+  ${HF_REPO:+hf_repo=$HF_REPO} ${DRIVE_REMOTE:+drive_remote=$DRIVE_REMOTE} \
+  +project_name=$PROJECT +run_name=$RUN +checkpoint_path=$CKPT_DIR
+
+touch $CKPT_DIR/DONE
+echo "=== $(date) done ==="

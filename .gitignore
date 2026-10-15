@@ -11,3 +11,14 @@ checkpoints/
 /data/
 /outputs/
 /wandb/
+# OS / tooling
+.DS_Store
+.pytest_cache/
+
+# Large or regenerable result files (summaries, verdicts and metrics stay tracked)
+results/**/*.pt
+results/**/step_*_all_preds.*
+results/**/job.log
+results/**/t0_job.log
+results/finetune/*/evaluator_*/
+results/**/failures.jsonl

@@ -1,28 +1,11 @@
-"""T0: zero-step evaluation of a vocab-transplanted checkpoint.
+"""T0: Maze-Hard accuracy of a checkpoint after vocabulary expansion, no fine-tuning.
+~baseline means the expansion is clean; near zero means it is broken.
 
-Question answered: does the pretrained maze checkpoint still score its
-baseline exact-accuracy AFTER the 6 -> 11 vocabulary transplant, with no
-fine-tuning at all?
+    python -m trm.diagnostics.t0_zero_step --ckpt <ckpt> --config config/resolved/maze_hard_pretrained.yaml \
+        --data data/maze-30x30-hard-1k [--no-transplant] [--v-old 11] --out <json>
 
-  ~baseline  -> transplant is clean; the fine-tune failure is downstream
-  near zero  -> the transplant itself is broken; fix before anything else
-
-Run it twice to separate the transplant from everything else:
-
-  # control: no transplant, vocab 6, should reproduce the published number
-  python -m trm.diagnostics.t0_zero_step \
-      --ckpt alphaXiv/trm-model-maze/maze_hard_step_32550 \
-      --config checkpoints/maze-custom/all_config.yaml \
-      --data data/maze-30x30-hard-1k \
-      --no-transplant \
-      --out results/t0_control.json
-
-  # treatment: transplanted to vocab 11, same data
-  python -m trm.diagnostics.t0_zero_step \
-      --ckpt alphaXiv/trm-model-maze/maze_hard_step_32550 \
-      --config checkpoints/maze-custom/all_config.yaml \
-      --data data/maze-30x30-hard-1k \
-      --out results/t0_transplant.json
+--no-transplant evaluates the checkpoint as is (control, or an already-expanded
+checkpoint with --v-old 11); otherwise its vocabulary is expanded in memory first.
 """
 
 import os

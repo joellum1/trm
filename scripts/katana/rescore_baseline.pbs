@@ -1,0 +1,18 @@
+#!/bin/bash
+# E1/E5: published checkpoint on the Maze-Hard test set, scored with the route checker.
+#PBS -N trm-rescore
+#PBS -l select=1:ncpus=8:ngpus=1:mem=48gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+set -euo pipefail
+cd $HOME/thesis/trm
+source scripts/katana/env.sh
+OUT=results/maze_hard_baseline
+mkdir -p $OUT
+exec > $OUT/job.log 2>&1
+hostname; nvidia-smi --query-gpu=name --format=csv,noheader
+python scripts/rescore_maze_preds.py \
+  --checkpoint checkpoints/maze/maze_hard_step_32550 \
+  --config config/resolved/maze_hard_pretrained.yaml \
+  --dataset data/maze-30x30-hard-1k \
+  --outdir $OUT

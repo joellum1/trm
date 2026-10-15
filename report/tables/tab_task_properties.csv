@@ -1,0 +1,3 @@
+Task,Mazes,With cycles,≥2 checkpoints,R/N change route,Shortest routes
+"Custom (1,000-maze eval set)","1,000",0,759,0,1 (unique)
+Maze-Hard (test),"1,000","1,000",--,--,median 3.8M (min 96)

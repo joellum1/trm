@@ -1,31 +1,21 @@
-"""Structural evaluation of maze path predictions.
+"""Structural metrics for maze predictions (exact match collapses all failures).
 
-Exact-match scoring cannot distinguish "emitted a valid alternate shortest
-path" from "emitted garbage". Both score zero. This evaluator decomposes the
-prediction into properties that exact-match collapses:
+  path/connected              path cells form one 4-connected piece containing S and G
+  path/legal                  no path cell on a wall
+  path/valid                  connected, legal, exactly one S and one G
+  path/optimal                valid and as long as the label
+  path/valid_not_exact        optimal but different from the label
+  path/checkpoint_coverage    C tiles kept as C in the output
+  path/all_checkpoints        mazes keeping every C. Not routing: copying the input scores 1.0
+  path/reaches_all_checkpoints  mazes where every C is connected to S (the routing measure)
+  path/largest_component      largest fragment / path cells
+  path/length_ratio           predicted / label length (valid only)
+  path/verdict/<category>     maze_checker verdict share
+  path/broken_primary/<code>  share broken, by first reason
 
-  path/connected              single 4-connected component from S to G
-  path/legal                  no predicted path cell sits on a wall
-  path/valid                  connected AND legal AND has exactly one S, one G
-  path/optimal                valid AND same length as the reference solution
-  path/valid_not_exact        valid, optimal length, but DIFFERS from the label
-                              -> the alternate-path mislabel rate
-  path/checkpoint_coverage    fraction of mandatory C tiles the path crosses
-  path/all_checkpoints        fraction of mazes hitting every C tile
-  path/largest_component      largest connected fragment / total path cells
-                              -> moves long before exact_accuracy does; the
-                                 early-warning signal during fine-tuning
-  path/length_ratio           predicted length / reference length (valid only)
-
-Token ids (trm/data/custom/build_maze_dataset.py, CHARSET = "# SGoCRrNn"):
-  0 PAD   1 '#' wall   2 ' ' empty   3 'S' start   4 'G' goal   5 'o' path
-  6 'C' checkpoint     7 'R' reward  8 'r' reward crossed
-  9 'N' penalty       10 'n' penalty crossed
-
-Enable with, in the training config:
-
-  evaluators:
-    - name: maze_path@MazePath
+Per-maze verdicts go to verdicts.jsonl in the evaluator's save directory.
+Token ids follow CHARSET "# SGoCRrNn" (0 = PAD). Enable with
+evaluators: [{name: maze_path@MazePath}].
 """
 
 import os
@@ -38,6 +28,9 @@ import torch
 import torch.distributed as dist
 
 from trm.data.puzzle_dataset import PuzzleDatasetMetadata
+from trm.evaluation.maze_checker import (
+    check, optimal_cost, to_rows, CATEGORIES, REASON_CODES, BROKEN,
+)
 
 PAD, WALL, EMPTY, START, GOAL, PATH = 0, 1, 2, 3, 4, 5
 CHECKPOINT, REWARD, REWARD_X, PENALTY, PENALTY_X = 6, 7, 8, 9, 10
@@ -148,10 +141,14 @@ class MazePath:
         self.save_failures = save_failures
         self._rows = []
         self._failures = []
+        self._verdicts = []
+        # The eval set is fixed, so solve each maze once.
+        self._opt_cache: Dict[bytes, Any] = {}
 
     def begin_eval(self):
         self._rows = []
         self._failures = []
+        self._verdicts = []
 
     def update_batch(self, batch: Dict[str, torch.Tensor],
                      preds: Dict[str, torch.Tensor]):
@@ -169,10 +166,9 @@ class MazePath:
         labels = got["labels"].numpy()
         predsn = got["preds"].numpy()
 
-        # Padding rows are all-PAD labels. (Do NOT mask on puzzle_identifiers:
-        # maze has num_puzzle_identifiers=1 and blank_identifier_id=0, so every
-        # real example carries the blank id.)
-        keep = (labels != PAD).any(axis=-1)
+        # Padding rows have all-PAD inputs. Not labels (collate turns label PAD
+        # into -100) and not puzzle_identifiers (every maze has the blank id).
+        keep = (inputs != PAD).any(axis=-1)
 
         s = self.side
         for i in np.nonzero(keep)[0]:
@@ -182,21 +178,37 @@ class MazePath:
             lab = labels[i].reshape(s, s)
             prd = predsn[i].reshape(s, s)
             row = _score_one(inp, lab, prd)
+
+            key = inp.tobytes()
+            if key not in self._opt_cache:
+                self._opt_cache[key] = optimal_cost(to_rows(inp))
+            verdict = check(inp, prd, lab, opt=self._opt_cache[key])
+            for cat in CATEGORIES:
+                row[f"verdict/{cat}"] = float(verdict.category == cat)
+            codes = {c for c, _ in verdict.reasons}
+            row["reaches_all_checkpoints"] = (
+                float(not codes & {"missed_checkpoint", "start_missing", "bad_shape"})
+                if (inp == CHECKPOINT).any() else float("nan"))
+            for code in REASON_CODES[:-1]:
+                row[f"broken_primary/{code}"] = float(verdict.category == BROKEN and verdict.primary_reason == code)
+            self._verdicts.append(verdict.to_dict())
+
             self._rows.append(row)
-            if not row["valid"] and len(self._failures) < self.save_failures:
+            if verdict.category != "valid_shortest" and len(self._failures) < self.save_failures:
                 self._failures.append(
                     {"input": inp.tolist(), "label": lab.tolist(),
-                     "pred": prd.tolist(), "scores": row})
+                     "pred": prd.tolist(), "scores": row, "verdict": verdict.to_dict()})
 
     def result(self, save_path: Optional[str], rank: int, world_size: int,
                group: Optional[Any] = None) -> Optional[Dict[str, float]]:
-        rows = self._rows
+        rows, verdicts = self._rows, self._verdicts
         if world_size > 1:
             gathered = [None] * world_size if rank == 0 else None
-            dist.gather_object(rows, gathered, dst=0, group=group)
+            dist.gather_object((rows, verdicts), gathered, dst=0, group=group)
             if rank != 0:
                 return None
-            rows = [r for part in gathered for r in part]  # type: ignore
+            rows = [r for part in gathered for r in part[0]]  # type: ignore
+            verdicts = [v for part in gathered for v in part[1]]  # type: ignore
         elif rank != 0:
             return None
 
@@ -212,9 +224,13 @@ class MazePath:
                 out[f"path/{k}"] = float(vals.mean())
         out["path/n_scored"] = float(len(rows))
 
-        if save_path and self._failures:
+        if save_path:
             os.makedirs(save_path, exist_ok=True)
-            with open(os.path.join(save_path, "failures.json"), "w") as f:
-                json.dump(self._failures, f)
+            with open(os.path.join(save_path, "verdicts.jsonl"), "w") as f:
+                for i, v in enumerate(verdicts):
+                    f.write(json.dumps({"index": i, **v}) + "\n")
+            if self._failures:
+                with open(os.path.join(save_path, "failures.json"), "w") as f:
+                    json.dump(self._failures, f)
 
         return out

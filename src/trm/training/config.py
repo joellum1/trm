@@ -61,6 +61,15 @@ class PretrainConfig(pydantic.BaseModel):
     min_eval_interval: Optional[int] = 0  # when to start eval
     eval_save_outputs: List[str] = []
 
+    # If set, eval/checkpoint on these step multiples (and at the end) instead of per eval_interval.
+    eval_every_steps: Optional[int] = None
+    checkpoint_every_steps: Optional[int] = None
+    resume: bool = False  # continue from <checkpoint_path>/last.pt
+
+    # step_N copies, see trm/training/sync.py
+    hf_repo: Optional[str] = None       # "<user>/<repo>"
+    drive_remote: Optional[str] = None  # rclone "<remote>:<folder>"
+
     ema: bool = False  # use Exponential-Moving-Average
     ema_rate: float = 0.999  # EMA-rate
     freeze_weights: bool = False  # If True, freeze weights and only learn the embeddings

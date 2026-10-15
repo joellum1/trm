@@ -1,0 +1,9 @@
+Failure detail,Mazes
+"Valid, longer by +2 steps",59
+"Valid, longer by +4 steps",6
+"Valid, longer by +6 steps",4
+"Valid, longer by +8 steps",3
+"Valid, longer by +10 steps",1
+"Valid, longer by +16 steps",3
+Broken: tile altered,6
+Broken: disconnected,2
